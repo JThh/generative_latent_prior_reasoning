@@ -1,0 +1,45 @@
+# python3 glp_train.py config=configs/train_phi4_reasoning.yaml
+# Reasoning GLP for Phi-4-Reasoning (mini)
+# Architecture: Phi-4-mini, 32 layers, hidden_dim=3072
+# Microsoft's SFT + RL reasoning model, strong math performance
+save_root: .
+model_name: microsoft/Phi-4-mini-reasoning
+run_name: glp-phi4-reasoning-d${glp_kwargs.denoiser_config.n_layers}
+output_path: ${save_root}/runs/${run_name}
+# wandb
+wandb_enabled: True
+wandb_project: reasoning-glp
+wandb_run_name: ${run_name}
+# data
+train_dataset: ${save_root}/data/phi4-reasoning-layer16-reasoning
+rep_statistic: ${train_dataset}/rep_statistics.pt
+num_epochs: 1
+save_epochs: [1]
+shuffle: True
+# model
+glp_kwargs:
+  normalizer_config:
+    rep_statistic: ${rep_statistic}
+  denoiser_config:
+    d_input: 3072    # Phi-4-mini hidden dim
+    d_model: 6144    # d_input * 2
+    d_mlp: 12288     # d_input * 4
+    n_layers: 6
+    multi_layer_n_layers: null
+  tracedict_config:
+    layer_prefix: "model.layers"
+    layers: [16]     # middle of 32 layers
+    retain: "output"
+# training
+use_bf16: True
+learning_rate: 5e-5
+batch_size: 4096
+gradient_accumulation_steps: 1
+gradient_clipping_threshold: 1
+log_every_n_steps: 10
+save_opt_state: True
+lr_scheduler:
+  scheduler_cls: cosine_scheduler_with_warmup
+  warmup_ratio: 0.01
+  initial_factor: 0.01
+  final_factor: 0.1

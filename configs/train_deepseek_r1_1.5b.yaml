@@ -1,0 +1,44 @@
+# python3 glp_train.py config=configs/train_deepseek_r1_1.5b.yaml
+# Reasoning GLP for DeepSeek-R1-Distill-Qwen-1.5B
+# Architecture: Qwen2.5-1.5B, 28 layers, hidden_dim=1536
+save_root: .
+model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+run_name: glp-deepseek-r1-1.5b-d${glp_kwargs.denoiser_config.n_layers}
+output_path: ${save_root}/runs/${run_name}
+# wandb
+wandb_enabled: True
+wandb_project: reasoning-glp
+wandb_run_name: ${run_name}
+# data
+train_dataset: ${save_root}/data/deepseek-r1-1.5b-layer14-reasoning
+rep_statistic: ${train_dataset}/rep_statistics.pt
+num_epochs: 1
+save_epochs: [1]
+shuffle: True
+# model
+glp_kwargs:
+  normalizer_config:
+    rep_statistic: ${rep_statistic}
+  denoiser_config:
+    d_input: 1536    # Qwen2.5-1.5B hidden dim
+    d_model: 3072    # d_input * 2
+    d_mlp: 6144      # d_input * 4
+    n_layers: 6
+    multi_layer_n_layers: null
+  tracedict_config:
+    layer_prefix: "model.layers"
+    layers: [14]     # middle of 28 layers
+    retain: "output"
+# training
+use_bf16: True
+learning_rate: 5e-5
+batch_size: 4096
+gradient_accumulation_steps: 1
+gradient_clipping_threshold: 1
+log_every_n_steps: 10
+save_opt_state: True
+lr_scheduler:
+  scheduler_cls: cosine_scheduler_with_warmup
+  warmup_ratio: 0.01
+  initial_factor: 0.01
+  final_factor: 0.1

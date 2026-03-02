@@ -1,0 +1,44 @@
+# python3 glp_train.py config=configs/train_qwen3_4b.yaml
+# Reasoning GLP for Qwen3-4B (thinking mode)
+# Architecture: Qwen3-4B, 36 layers, hidden_dim=2560
+save_root: .
+model_name: Qwen/Qwen3-4B
+run_name: glp-qwen3-4b-d${glp_kwargs.denoiser_config.n_layers}
+output_path: ${save_root}/runs/${run_name}
+# wandb
+wandb_enabled: True
+wandb_project: reasoning-glp
+wandb_run_name: ${run_name}
+# data
+train_dataset: ${save_root}/data/qwen3-4b-layer18-reasoning
+rep_statistic: ${train_dataset}/rep_statistics.pt
+num_epochs: 1
+save_epochs: [1]
+shuffle: True
+# model
+glp_kwargs:
+  normalizer_config:
+    rep_statistic: ${rep_statistic}
+  denoiser_config:
+    d_input: 2560    # Qwen3-4B hidden dim
+    d_model: 5120    # d_input * 2
+    d_mlp: 10240     # d_input * 4
+    n_layers: 6
+    multi_layer_n_layers: null
+  tracedict_config:
+    layer_prefix: "model.layers"
+    layers: [18]     # middle of 36 layers
+    retain: "output"
+# training
+use_bf16: True
+learning_rate: 5e-5
+batch_size: 4096
+gradient_accumulation_steps: 1
+gradient_clipping_threshold: 1
+log_every_n_steps: 10
+save_opt_state: True
+lr_scheduler:
+  scheduler_cls: cosine_scheduler_with_warmup
+  warmup_ratio: 0.01
+  initial_factor: 0.01
+  final_factor: 0.1
