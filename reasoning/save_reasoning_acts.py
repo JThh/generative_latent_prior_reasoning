@@ -11,6 +11,7 @@ Supports:
 """
 
 import json
+import importlib.util
 import logging
 import os
 import time
@@ -43,6 +44,21 @@ from reasoning.benchmarks import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MODEL_CONFIG_FILES = ("config.json",)
+TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "vocab.json",
+    "merges.txt",
+    "tokenizer_config.json",
+)
+MODEL_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+
 
 # ==============================
 #   Phase index mapping
@@ -60,8 +76,13 @@ PHASE_TO_IDX = {
 class SaveReasoningActsConfig:
     # model
     model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    model_source: Optional[str] = None
     torch_dtype: str = "bfloat16"
     device: str = "cuda:0"
+    cache_dir: Optional[str] = None
+    local_files_only: bool = False
+    disable_xet: bool = True
+    enable_hf_transfer: bool = True
     # layers to extract from (0-indexed)
     # - Single int: extract from that layer only
     # - List of ints: extract from those layers
@@ -87,6 +108,12 @@ class SaveReasoningActsConfig:
     # output
     output_dir: str = "data/reasoning_acts"
     memmap_file_size: int = 10_000_000   # elements per memmap file
+    colab_mode: bool = False              # enable Colab-friendly defaults
+    flush_every_n_traces: int = 25        # periodic writer flush/checkpoint
+    max_saved_tokens: Optional[int] = None
+    keep_token_mappings_in_memory: bool = True
+    keep_examples_metadata_in_memory: bool = True
+    save_trace_metadata_jsonl: bool = True
     # labeling
     enable_labeling: bool = True
     enable_phase_tracking: bool = True
@@ -155,30 +182,227 @@ def determine_middle_layer(model) -> int:
     raise ValueError("Could not determine number of layers")
 
 
-def _find_subsequence_positions(sequence: list[int], subseq: list[int]) -> list[int]:
-    """Return token positions covered by all occurrences of subseq in sequence."""
-    if not subseq or len(subseq) > len(sequence):
+def find_marker_token_indices(generated_tokens: list[str], markers: list[str]) -> list[int]:
+    """
+    Return token indices whose decoded token text overlaps any marker string.
+
+    This works even when a tokenizer splits a marker like `<think>` into
+    multiple pieces such as `<`, `think`, `>`.
+    """
+    joined_text = ""
+    token_char_ranges = []
+    for token in generated_tokens:
+        start = len(joined_text)
+        joined_text += token
+        token_char_ranges.append((start, len(joined_text)))
+
+    if not joined_text:
         return []
-    positions = []
-    for i in range(len(sequence) - len(subseq) + 1):
-        if sequence[i : i + len(subseq)] == subseq:
-            positions.extend(range(i, i + len(subseq)))
-    return positions
 
-
-def find_reasoning_marker_positions(
-    generated_ids: list[int],
-    tokenizer: AutoTokenizer,
-    markers: tuple[str, ...],
-) -> list[int]:
-    """Find generated token indices that form configured reasoning marker tokens."""
-    marker_positions: set[int] = set()
+    spans = []
     for marker in markers:
-        marker_ids = tokenizer.encode(marker, add_special_tokens=False)
-        if not marker_ids:
-            continue
-        marker_positions.update(_find_subsequence_positions(generated_ids, marker_ids))
-    return sorted(marker_positions)
+        search_start = 0
+        while True:
+            idx = joined_text.find(marker, search_start)
+            if idx == -1:
+                break
+            spans.append((idx, idx + len(marker)))
+            search_start = idx + 1
+
+    if not spans:
+        return []
+
+    matches = []
+    for tok_idx, (tok_start, tok_end) in enumerate(token_char_ranges):
+        if any(tok_start < span_end and tok_end > span_start for span_start, span_end in spans):
+            matches.append(tok_idx)
+    return sorted(set(matches))
+
+
+def resolve_model_load_kwargs(config: SaveReasoningActsConfig) -> tuple[dict, Optional[str]]:
+    """
+    Build `from_pretrained` kwargs and an optional post-load device move target.
+
+    `device_map` is intended for Accelerate sharding strategies (for example
+    "auto" or a module->device dict). Passing a raw device string like
+    "cuda:0" through `device_map` can trigger a slower path and obscures
+    whether the load is blocked on download or placement.
+    """
+    device = config.device
+    if isinstance(device, str) and device in {
+        "auto",
+        "balanced",
+        "balanced_low_0",
+        "sequential",
+    }:
+        return {"device_map": device}, None
+
+    if isinstance(device, dict):
+        return {"device_map": device}, None
+
+    return {}, device
+
+
+def get_model_cache_dir(cache_dir: Optional[str], model_name: str) -> Optional[Path]:
+    if not cache_dir:
+        return None
+    repo_id = model_name.replace("/", "--")
+    return Path(cache_dir) / f"models--{repo_id}"
+
+
+def has_any_file(directory: Path, filenames: tuple[str, ...]) -> bool:
+    return any((directory / name).exists() for name in filenames)
+
+
+def is_local_model_dir(path: Path) -> bool:
+    """
+    Return True when `path` looks like a self-contained model directory.
+
+    This supports exported model folders, shared artifact directories, and
+    ad-hoc local caches without assuming a specific Hugging Face cache layout.
+    """
+    if not path.is_dir():
+        return False
+
+    has_config = has_any_file(path, MODEL_CONFIG_FILES)
+    has_tokenizer = has_any_file(path, TOKENIZER_FILES)
+    has_weights = has_any_file(path, MODEL_WEIGHT_FILES)
+    return has_config and has_tokenizer and has_weights
+
+
+def get_local_model_dir(path_str: Optional[str]) -> Optional[Path]:
+    if not path_str:
+        return None
+    candidate = Path(path_str).expanduser()
+    if is_local_model_dir(candidate):
+        return candidate.resolve()
+    return None
+
+
+def detect_stale_incomplete_weights(
+    cache_dir: Optional[str],
+    model_name: str,
+) -> Optional[str]:
+    """
+    Detect a broken local Hugging Face cache state that causes silent stalls.
+
+    A common failure mode is: tokenizer/config are present, but the model
+    weights were interrupted mid-download, leaving only `.incomplete` files and
+    a leftover lock. In that case `from_pretrained` can block for a long time
+    while retrying or waiting on the lock.
+    """
+    model_cache_dir = get_model_cache_dir(cache_dir, model_name)
+    if model_cache_dir is None or not model_cache_dir.exists():
+        return None
+
+    snapshot_dir = model_cache_dir / "snapshots"
+    has_weight_file = False
+    if snapshot_dir.exists():
+        for pattern in (
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "pytorch_model*.bin",
+            "pytorch_model*.bin.index.json",
+        ):
+            if any(snapshot_dir.rglob(pattern)):
+                has_weight_file = True
+                break
+
+    incomplete_files = sorted((model_cache_dir / "blobs").glob("*.incomplete"))
+    lock_dir = Path(cache_dir) / ".locks" / model_cache_dir.name
+    lock_files = sorted(lock_dir.glob("*.lock")) if lock_dir.exists() else []
+
+    if has_weight_file or not incomplete_files:
+        return None
+
+    details = []
+    details.extend(str(path) for path in incomplete_files[:3])
+    details.extend(str(path) for path in lock_files[:3])
+    detail_str = ", ".join(details)
+    return (
+        "Detected an incomplete Hugging Face model download with no usable local "
+        f"weight file for '{model_name}'. Stale cache artifacts: {detail_str}. "
+        "Remove the stale `.incomplete` and `.lock` files, or use a fresh "
+        "`cache_dir`, then rerun."
+    )
+
+
+def resolve_model_source(
+    config: SaveReasoningActsConfig,
+    cache_dir: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """
+    Choose the model/tokenizer source path.
+
+    Resolution order:
+      1. explicit `model_source`
+      2. `model_name` if it points to a local model directory
+      3. `cache_dir` if it points to a local model directory
+      4. otherwise the remote Hugging Face model id in `model_name`
+    """
+    for label, candidate in (
+        ("explicit model source", config.model_source),
+        ("local model_name path", config.model_name),
+        ("local cache directory", cache_dir),
+    ):
+        local_dir = get_local_model_dir(candidate)
+        if local_dir is not None:
+            logger.info(f"Using {label}: {local_dir}")
+            return str(local_dir), None
+
+    return config.model_name, cache_dir
+
+
+def configure_hf_downloads(config: SaveReasoningActsConfig) -> Optional[str]:
+    """
+    Configure Hugging Face download behavior before any model/tokenizer loads.
+
+    Returning a cache dir lets the caller pass the same location through
+    `from_pretrained`, keeping behavior explicit and consistent.
+    """
+    cache_dir = config.cache_dir
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", cache_dir)
+        os.environ.setdefault("HF_HUB_CACHE", cache_dir)
+        os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
+
+    if config.disable_xet:
+        # The Xet transport can be much slower on networked filesystems.
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    if config.enable_hf_transfer:
+        if importlib.util.find_spec("hf_transfer") is not None:
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        else:
+            logger.info(
+                "hf_transfer is not installed; using the default Hugging Face downloader."
+            )
+
+    return cache_dir
+
+
+def apply_colab_defaults(config: SaveReasoningActsConfig) -> None:
+    """
+    Apply safer defaults for long runs on Google Colab.
+    """
+    if not config.colab_mode:
+        return
+
+    if str(config.output_dir) == "data/reasoning_acts":
+        config.output_dir = "/content/reasoning_acts"
+    if config.memmap_file_size == 10_000_000:
+        # 1,000,000 fp32 elements ~= 4MB per memmap shard.
+        config.memmap_file_size = 1_000_000
+    config.keep_token_mappings_in_memory = False
+    config.keep_examples_metadata_in_memory = False
+    config.save_trace_metadata_jsonl = True
+
+    logger.info(
+        "Colab mode enabled: using managed saving defaults "
+        f"(output_dir={config.output_dir}, memmap_file_size={config.memmap_file_size}, "
+        "streaming trace metadata)."
+    )
 
 
 @torch.no_grad()
@@ -281,6 +505,7 @@ def main():
     config_path = config_cli.pop("config", None)
     config_file = OmegaConf.load(config_path) if config_path else OmegaConf.create()
     config = OmegaConf.merge(config_base, config_file, config_cli)
+    apply_colab_defaults(config)
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -291,24 +516,62 @@ def main():
     # ── Load model ──────────────────────────────────────────────
     config.device = resolve_device(str(config.device))
     dtype = resolve_dtype_for_device(get_torch_dtype(config.torch_dtype), config.device)
+    cache_dir = configure_hf_downloads(config)
     logger.info(f"Loading model: {config.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
-    # `device_map` does not reliably support MPS placement; load then move.
+    if cache_dir:
+        logger.info(f"Using Hugging Face cache: {cache_dir}")
+    if config.local_files_only:
+        logger.info("Loading from local cache only; remote download is disabled.")
+    model_source, load_cache_dir = resolve_model_source(config, cache_dir)
+    logger.info("Loading tokenizer...")
+    load_start = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_source,
+        trust_remote_code=True,
+        cache_dir=load_cache_dir,
+        local_files_only=config.local_files_only,
+    )
+    logger.info(f"Tokenizer loaded in {time.time() - load_start:.1f}s")
+
+    model_load_kwargs, model_move_device = resolve_model_load_kwargs(config)
+    stale_cache_msg = None
+    if model_source == config.model_name:
+        stale_cache_msg = detect_stale_incomplete_weights(cache_dir, config.model_name)
+    if stale_cache_msg:
+        raise RuntimeError(stale_cache_msg)
+
+    logger.info(
+        "Loading model weights..."
+        + (
+            f" (device_map={model_load_kwargs['device_map']})"
+            if "device_map" in model_load_kwargs
+            else " (CPU load, then explicit device move)"
+        )
+    )
+    load_start = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
+        model_source,
         torch_dtype=dtype,
         trust_remote_code=True,
+        cache_dir=load_cache_dir,
+        local_files_only=config.local_files_only,
+        low_cpu_mem_usage=True,
+        **model_load_kwargs,
     )
-    model = model.to(config.device)
+    logger.info(f"Model weights loaded in {time.time() - load_start:.1f}s")
+
+    if model_move_device is not None:
+        logger.info(f"Moving model to device: {model_move_device}")
+        move_start = time.time()
+        model = model.to(model_move_device)
+        logger.info(f"Model moved to {model_move_device} in {time.time() - move_start:.1f}s")
     model.eval()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Determine layer
-    layer_idx = config.layer_idx
-    if layer_idx is None:
-        layer_idx = determine_middle_layer(model)
-        logger.info(f"Auto-selected middle layer: {layer_idx}")
+    # For now, always save a single middle layer to keep the dataset compact.
+    layer_idx = determine_middle_layer(model)
+    logger.info(f"Using middle layer only: {layer_idx}")
     layer_name = f"{config.layer_prefix}.{layer_idx}"
     hidden_dim = model.config.hidden_size
     logger.info(f"Extracting from: {layer_name} ({config.retain}), dim={hidden_dim}")
@@ -335,14 +598,19 @@ def main():
     all_cognitive_labels = {name: [] for name in labeler.label_names} if labeler else {}
     all_phase_labels = []          # int per token
     all_correctness = []           # int per token (0/1/-1 for unknown)
-    token_to_example = []
-    token_to_trace = []            # which trace index within an example
-    all_metadata = []
+    token_to_example = [] if config.keep_token_mappings_in_memory else None
+    token_to_trace = [] if config.keep_token_mappings_in_memory else None  # which trace index within an example
+    all_metadata = [] if config.keep_examples_metadata_in_memory else None
+    trace_metadata_path = output_dir / "trace_metadata.jsonl"
+    if config.save_trace_metadata_jsonl:
+        trace_metadata_path.write_text("")
 
     # Running statistics
     running_sum = torch.zeros(hidden_dim, dtype=torch.float64)
     running_sq_sum = torch.zeros(hidden_dim, dtype=torch.float64)
     total_tokens = 0
+    traces_processed = 0
+    stop_due_to_token_cap = False
 
     # ── Process examples ────────────────────────────────────────
     logger.info("Starting activation extraction...")
@@ -372,20 +640,27 @@ def main():
                 logger.warning(f"Error on example {ex_idx} trace {trace_idx}: {e}")
                 continue
 
-            acts = result["activations"]
+            marker_indices = find_marker_token_indices(
+                result["generated_tokens"],
+                list(config.reasoning_markers),
+            )
+            if not marker_indices:
+                continue
+
+            acts = [result["activations"][idx] for idx in marker_indices]
+            saved_tokens = [result["generated_tokens"][idx] for idx in marker_indices]
             if len(acts) == 0:
                 continue
 
-            marker_positions = find_reasoning_marker_positions(
-                generated_ids=result["generated_ids"],
-                tokenizer=tokenizer,
-                markers=tuple(config.reasoning_markers),
-            )
-            if len(marker_positions) == 0:
-                continue
-
-            acts = [acts[i] for i in marker_positions]
-            result["generated_tokens"] = [result["generated_tokens"][i] for i in marker_positions]
+            if config.max_saved_tokens is not None:
+                remaining = config.max_saved_tokens - total_tokens
+                if remaining <= 0:
+                    stop_due_to_token_cap = True
+                    break
+                if len(acts) > remaining:
+                    acts = acts[:remaining]
+                    saved_tokens = saved_tokens[:remaining]
+                    marker_indices = marker_indices[:remaining]
 
             # Determine correctness of this trace
             trace_correct = -1  # unknown
@@ -408,32 +683,60 @@ def main():
 
             # Cognitive labels
             if labeler is not None:
-                token_labels = labeler.label_tokens(result["generated_tokens"])
+                token_labels = labeler.label_tokens(saved_tokens)
                 for name in labeler.label_names:
                     all_cognitive_labels[name].extend(token_labels[name].tolist())
 
             # Phase labels
             if config.enable_phase_tracking:
-                phases = assign_all_phases(n_act, result["generated_tokens"])
+                phases = assign_all_phases(n_act, saved_tokens)
                 all_phase_labels.extend([PHASE_TO_IDX.get(p, 2) for p in phases])
 
             # Correctness per token (same for all tokens in a trace)
             all_correctness.extend([trace_correct] * n_act)
 
             # Track mappings
-            token_to_example.extend([ex_idx] * n_act)
-            token_to_trace.extend([trace_idx] * n_act)
+            if token_to_example is not None:
+                token_to_example.extend([ex_idx] * n_act)
+            if token_to_trace is not None:
+                token_to_trace.extend([trace_idx] * n_act)
 
             # Per-trace metadata
-            all_metadata.append({
+            trace_metadata = {
                 "example_idx": ex_idx,
                 "trace_idx": trace_idx,
                 "question": question[:200],
                 "n_generated_tokens": n_act,
-                "n_reasoning_marker_tokens": len(marker_positions),
+                "n_reasoning_marker_tokens": n_act,
+                "n_saved_tokens": n_act,
+                "saved_token_indices": marker_indices,
+                "saved_tokens": saved_tokens,
                 "generated_text_preview": result["generated_text"][:300],
                 "correct": trace_correct,
-            })
+            }
+            if all_metadata is not None:
+                all_metadata.append(trace_metadata)
+            if config.save_trace_metadata_jsonl:
+                with open(trace_metadata_path, "a") as f:
+                    f.write(json.dumps(trace_metadata) + "\n")
+
+            traces_processed += 1
+            if config.flush_every_n_traces > 0 and traces_processed % config.flush_every_n_traces == 0:
+                writer.flush()
+                with open(output_dir / "progress.json", "w") as f:
+                    json.dump(
+                        {
+                            "examples_seen": ex_idx + 1,
+                            "traces_processed": traces_processed,
+                            "total_saved_tokens": total_tokens,
+                        },
+                        f,
+                        indent=2,
+                    )
+
+            if config.max_saved_tokens is not None and total_tokens >= config.max_saved_tokens:
+                stop_due_to_token_cap = True
+                break
 
         # Periodic progress
         if (ex_idx + 1) % 50 == 0:
@@ -442,6 +745,12 @@ def main():
                 f"Processed {ex_idx + 1}/{len(examples)} examples, "
                 f"{total_tokens} tokens, {elapsed:.1f}s"
             )
+        if stop_due_to_token_cap:
+            logger.info(
+                f"Reached max_saved_tokens={config.max_saved_tokens}. "
+                "Stopping early by design."
+            )
+            break
 
     # ── Flush and save ──────────────────────────────────────────
     writer.flush()
@@ -494,12 +803,16 @@ def main():
         "dataset_split": config.dataset_split,
         "n_examples": len(examples),
         "n_traces_per_prompt": num_traces,
-        "n_traces_total": len(all_metadata),
+        "n_traces_total": traces_processed,
         "total_tokens": total_tokens,
+        "saved_token_selector": "thinking_markers_only",
         "max_new_tokens": config.max_new_tokens,
-        "token_to_example": token_to_example,
-        "token_to_trace": token_to_trace,
-        "examples": all_metadata,
+        "max_saved_tokens": config.max_saved_tokens,
+        "token_to_example": token_to_example if token_to_example is not None else [],
+        "token_to_trace": token_to_trace if token_to_trace is not None else [],
+        "examples": all_metadata if all_metadata is not None else [],
+        "token_mappings_streamed": token_to_example is None,
+        "trace_metadata_jsonl": str(trace_metadata_path) if config.save_trace_metadata_jsonl else None,
     }
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -509,7 +822,7 @@ def main():
     elapsed = time.time() - start_time
     logger.info(
         f"Done! {total_tokens} activations from "
-        f"{len(all_metadata)} traces ({len(examples)} examples) "
+        f"{traces_processed} traces ({len(examples)} examples) "
         f"saved to {output_dir} in {elapsed:.1f}s"
     )
 

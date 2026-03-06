@@ -29,6 +29,8 @@ dependencies = [
     "baukit @ git+https://github.com/davidbau/baukit",
     "nnsight==0.5.0",
     "sae-lens==6.34.2",
+    "modelscope>=1.34.0",
+    "setuptools>=68,<81",
 ]
 
 [tool.setuptools]
