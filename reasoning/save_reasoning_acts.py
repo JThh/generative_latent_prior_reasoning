@@ -92,6 +92,8 @@ class SaveReasoningActsConfig:
     enable_phase_tracking: bool = True
     # correctness conditioning
     track_correctness: bool = True
+    # reasoning marker tokens to keep activations for
+    reasoning_markers: tuple[str, ...] = ("<think>", "</think>")
 
 
 def get_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -101,6 +103,40 @@ def get_torch_dtype(dtype_str: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
     }
     return mapping.get(dtype_str, torch.bfloat16)
+
+
+def resolve_device(requested_device: str) -> str:
+    """
+    Resolve runtime device safely.
+
+    Falls back to CPU if CUDA/MPS is requested but unavailable.
+    """
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        fallback = "mps" if mps_available else "cpu"
+        logger.warning(
+            f"Requested device '{requested_device}' but CUDA is unavailable. "
+            f"Falling back to '{fallback}'."
+        )
+        return fallback
+
+    if requested_device == "mps":
+        if not mps_available:
+            logger.warning(
+                "Requested device 'mps' but MPS is unavailable. Falling back to 'cpu'."
+            )
+            return "cpu"
+
+    return requested_device
+
+
+def resolve_dtype_for_device(dtype: torch.dtype, device: str) -> torch.dtype:
+    """Adjust dtype for backend limitations."""
+    if device == "mps" and dtype == torch.bfloat16:
+        logger.warning("MPS + bfloat16 can be unstable; using float16 instead.")
+        return torch.float16
+    return dtype
 
 
 def determine_middle_layer(model) -> int:
@@ -119,6 +155,32 @@ def determine_middle_layer(model) -> int:
     raise ValueError("Could not determine number of layers")
 
 
+def _find_subsequence_positions(sequence: list[int], subseq: list[int]) -> list[int]:
+    """Return token positions covered by all occurrences of subseq in sequence."""
+    if not subseq or len(subseq) > len(sequence):
+        return []
+    positions = []
+    for i in range(len(sequence) - len(subseq) + 1):
+        if sequence[i : i + len(subseq)] == subseq:
+            positions.extend(range(i, i + len(subseq)))
+    return positions
+
+
+def find_reasoning_marker_positions(
+    generated_ids: list[int],
+    tokenizer: AutoTokenizer,
+    markers: tuple[str, ...],
+) -> list[int]:
+    """Find generated token indices that form configured reasoning marker tokens."""
+    marker_positions: set[int] = set()
+    for marker in markers:
+        marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+        if not marker_ids:
+            continue
+        marker_positions.update(_find_subsequence_positions(generated_ids, marker_ids))
+    return sorted(marker_positions)
+
+
 @torch.no_grad()
 def extract_cot_activations(
     model: AutoModelForCausalLM,
@@ -135,6 +197,7 @@ def extract_cot_activations(
         - activations: list of (hidden_dim,) tensors
         - generated_text: full generated text
         - generated_tokens: list of token strings
+        - generated_ids: list of token ids
         - input_length: number of input tokens
     """
     # Prepare input
@@ -206,6 +269,7 @@ def extract_cot_activations(
         "activations": activations,
         "generated_text": generated_text,
         "generated_tokens": generated_tokens,
+        "generated_ids": generated_ids.tolist(),
         "input_length": input_length,
     }
 
@@ -225,15 +289,17 @@ def main():
     logger.info(f"Output directory: {output_dir}")
 
     # ── Load model ──────────────────────────────────────────────
-    dtype = get_torch_dtype(config.torch_dtype)
+    config.device = resolve_device(str(config.device))
+    dtype = resolve_dtype_for_device(get_torch_dtype(config.torch_dtype), config.device)
     logger.info(f"Loading model: {config.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+    # `device_map` does not reliably support MPS placement; load then move.
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=dtype,
-        device_map=config.device,
         trust_remote_code=True,
     )
+    model = model.to(config.device)
     model.eval()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -310,6 +376,17 @@ def main():
             if len(acts) == 0:
                 continue
 
+            marker_positions = find_reasoning_marker_positions(
+                generated_ids=result["generated_ids"],
+                tokenizer=tokenizer,
+                markers=tuple(config.reasoning_markers),
+            )
+            if len(marker_positions) == 0:
+                continue
+
+            acts = [acts[i] for i in marker_positions]
+            result["generated_tokens"] = [result["generated_tokens"][i] for i in marker_positions]
+
             # Determine correctness of this trace
             trace_correct = -1  # unknown
             if config.track_correctness and gold_answer is not None:
@@ -353,6 +430,7 @@ def main():
                 "trace_idx": trace_idx,
                 "question": question[:200],
                 "n_generated_tokens": n_act,
+                "n_reasoning_marker_tokens": len(marker_positions),
                 "generated_text_preview": result["generated_text"][:300],
                 "correct": trace_correct,
             })
