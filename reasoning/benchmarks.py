@@ -19,6 +19,7 @@ Supported datasets (evaluation benchmarks):
   - MBPP: Python programming problems (google-research-datasets/mbpp)
 """
 
+import math
 import re
 import logging
 from dataclasses import dataclass
@@ -513,13 +514,15 @@ def extract_final_answer(cot_text: str) -> Optional[str]:
 
     # 2. "the answer is" patterns
     patterns = [
-        r"(?:the\s+)?(?:final\s+)?answer\s+is\s*[:\s]*([^\.\n,]+)",
-        r"(?:therefore|thus|hence|so)\s*,?\s*(?:the\s+)?(?:answer\s+is\s*)?[:\s]*(\-?\d[\d,\.]*)",
+        r"(?:the\s+)?(?:final\s+)?answer\s+is\s*[:\s]*([^\n]+)",
+        r"(?:therefore|thus|hence|so)\s*,?\s*(?:the\s+)?(?:answer\s+is\s*)?[:\s]*([^\n]+)",
     ]
     for pat in patterns:
         match = re.search(pat, cot_text, re.IGNORECASE)
         if match:
-            answer = match.group(1).strip().rstrip(".")
+            answer = match.group(1).strip()
+            answer = re.split(r"(?:(?:\s+with)|(?:\s+because)|(?:\s+where))\b", answer, maxsplit=1)[0]
+            answer = answer.rstrip(" .,;:!?)")
             return answer
 
     # 3. #### notation
@@ -541,7 +544,36 @@ def normalize_answer(answer: str) -> Optional[float]:
     if answer is None:
         return None
 
-    answer = answer.strip().replace(",", "").replace("$", "").replace("%", "").replace(" ", "")
+    answer = str(answer).strip()
+
+    # Remove common wrappers and formatting noise.
+    answer = answer.replace("$", "").replace(",", "")
+    answer = re.sub(r"\\left|\\right", "", answer)
+    answer = answer.strip().strip(" \t\n\r.,;:!?)(")
+
+    # Handle `x = ...` / `y=...` / `answer = ...`.
+    eq_match = re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*(.+)$", answer)
+    if eq_match:
+        answer = eq_match.group(1).strip()
+
+    # Handle boxed expressions if still present.
+    boxed = extract_boxed(answer)
+    if boxed is not None:
+        answer = boxed.strip()
+
+    # Handle LaTeX fractions like \frac{3}{4}.
+    frac_latex_match = re.match(
+        r"^\\frac\{(-?\d+(?:\.\d+)?)\}\{(-?\d+(?:\.\d+)?)\}$",
+        answer,
+    )
+    if frac_latex_match:
+        num = float(frac_latex_match.group(1))
+        den = float(frac_latex_match.group(2))
+        if den == 0:
+            return None
+        return num / den
+
+    answer = answer.replace(" ", "")
 
     # Handle fractions
     frac_match = re.match(r"^(-?\d+)\s*/\s*(\d+)$", answer)
@@ -549,10 +581,33 @@ def normalize_answer(answer: str) -> Optional[float]:
         num, den = float(frac_match.group(1)), float(frac_match.group(2))
         return num / den if den != 0 else None
 
+    # Handle percentages explicitly.
+    pct_match = re.match(r"^(-?\d+(?:\.\d+)?)%$", answer)
+    if pct_match:
+        return float(pct_match.group(1)) / 100.0
+
     try:
-        return float(answer)
+        val = float(answer)
+        if not math.isfinite(val):
+            return None
+        return val
     except ValueError:
         return None
+
+
+def canonicalize_answer_text(answer: str) -> str:
+    """
+    Canonicalize symbolic/text answers for robust string matching.
+    """
+    answer = str(answer).strip().lower()
+    answer = answer.replace("$", "")
+    answer = re.sub(r"\\left|\\right", "", answer)
+    answer = re.sub(r"\\boxed\{([^{}]+)\}", r"\1", answer)
+    answer = re.sub(r"^[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*", "", answer)  # drop `x =`
+    answer = re.sub(r"^\s*(?:the\s+)?(?:final\s+)?answer\s+is\s*[:\-]?\s*", "", answer)
+    answer = answer.strip().strip(" \t\n\r.,;:!?)(")
+    answer = re.sub(r"\s+", "", answer)
+    return answer
 
 
 def check_correctness(
@@ -575,8 +630,8 @@ def check_correctness(
             return abs(pred_num) < tolerance
         return abs(pred_num - gold_num) / max(abs(gold_num), 1e-10) < tolerance
 
-    pred_clean = re.sub(r"\s+", " ", predicted.strip().lower())
-    gold_clean = re.sub(r"\s+", " ", gold.strip().lower())
+    pred_clean = canonicalize_answer_text(predicted)
+    gold_clean = canonicalize_answer_text(gold)
     return pred_clean == gold_clean
 
 

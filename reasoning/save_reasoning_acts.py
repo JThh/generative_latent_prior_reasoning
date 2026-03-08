@@ -23,7 +23,12 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from glp.utils_acts import MemmapWriter
 from reasoning.label_cot_segments import (
@@ -121,6 +126,8 @@ class SaveReasoningActsConfig:
     track_correctness: bool = True
     # reasoning marker tokens to keep activations for
     reasoning_markers: tuple[str, ...] = ("<think>", "</think>")
+    stop_at_reasoning_end_marker: bool = True
+    reasoning_end_marker: str = "</think>"
 
 
 def get_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -405,6 +412,26 @@ def apply_colab_defaults(config: SaveReasoningActsConfig) -> None:
     )
 
 
+class StopOnTokenSequence(StoppingCriteria):
+    """
+    Stop generation once a target token-id sequence appears as a suffix
+    of the generated continuation.
+    """
+
+    def __init__(self, prompt_length: int, stop_sequence_ids: list[int]):
+        self.prompt_length = prompt_length
+        self.stop_sequence_ids = stop_sequence_ids
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        if not self.stop_sequence_ids:
+            return False
+        generated = input_ids[0, self.prompt_length :].tolist()
+        n = len(self.stop_sequence_ids)
+        if len(generated) < n:
+            return False
+        return generated[-n:] == self.stop_sequence_ids
+
+
 @torch.no_grad()
 def extract_cot_activations(
     model: AutoModelForCausalLM,
@@ -461,6 +488,15 @@ def extract_cot_activations(
 
     try:
         gen_kwargs = {"max_new_tokens": config.max_new_tokens}
+        if config.stop_at_reasoning_end_marker:
+            end_marker_ids = tokenizer.encode(
+                config.reasoning_end_marker,
+                add_special_tokens=False,
+            )
+            if end_marker_ids:
+                gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
+                    [StopOnTokenSequence(input_length, end_marker_ids)]
+                )
         if config.do_sample or config.num_traces_per_prompt > 1:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = config.temperature
@@ -706,7 +742,7 @@ def main():
                 "example_idx": ex_idx,
                 "trace_idx": trace_idx,
                 "question": question[:200],
-                "n_generated_tokens": n_act,
+                "n_generated_tokens": len(result["generated_tokens"]),
                 "n_reasoning_marker_tokens": n_act,
                 "n_saved_tokens": n_act,
                 "saved_token_indices": marker_indices,
