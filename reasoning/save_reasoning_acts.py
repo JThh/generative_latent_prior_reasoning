@@ -48,6 +48,10 @@ from reasoning.benchmarks import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+try:
+    import wandb
+except Exception:  # pragma: no cover
+    wandb = None
 
 MODEL_CONFIG_FILES = ("config.json",)
 TOKENIZER_FILES = (
@@ -119,6 +123,16 @@ class SaveReasoningActsConfig:
     keep_token_mappings_in_memory: bool = True
     keep_examples_metadata_in_memory: bool = True
     save_trace_metadata_jsonl: bool = True
+    # wandb logging
+    use_wandb: bool = False
+    wandb_project: str = "reasoning-activation-caching"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_mode: str = "online"            # "online", "offline", "disabled"
+    wandb_log_every_n_traces: int = 10
+    wandb_upload_output_artifact: bool = True
+    wandb_artifact_name: Optional[str] = None
     # labeling
     enable_labeling: bool = True
     enable_phase_tracking: bool = True
@@ -412,6 +426,27 @@ def apply_colab_defaults(config: SaveReasoningActsConfig) -> None:
     )
 
 
+def init_wandb_run(config: SaveReasoningActsConfig, output_dir: Path):
+    if not config.use_wandb:
+        return None
+    if wandb is None:
+        logger.warning("use_wandb=True but wandb is not available; continuing without wandb.")
+        return None
+
+    run = wandb.init(
+        project=config.wandb_project,
+        entity=config.wandb_entity,
+        name=config.wandb_run_name,
+        group=config.wandb_group,
+        mode=config.wandb_mode,
+        dir=str(output_dir),
+        config=OmegaConf.to_container(config, resolve=True),
+    )
+    if run is not None:
+        run.summary["output_dir"] = str(output_dir)
+    return run
+
+
 class StopOnTokenSequence(StoppingCriteria):
     """
     Stop generation once a target token-id sequence appears as a suffix
@@ -548,6 +583,7 @@ def main():
 
     logger.info(f"Config: {config}")
     logger.info(f"Output directory: {output_dir}")
+    wandb_run = init_wandb_run(config, output_dir)
 
     # ── Load model ──────────────────────────────────────────────
     config.device = resolve_device(str(config.device))
@@ -769,6 +805,20 @@ def main():
                         f,
                         indent=2,
                     )
+            if (
+                wandb_run is not None
+                and config.wandb_log_every_n_traces > 0
+                and traces_processed % config.wandb_log_every_n_traces == 0
+            ):
+                wandb.log(
+                    {
+                        "progress/examples_seen": ex_idx + 1,
+                        "progress/traces_processed": traces_processed,
+                        "progress/total_saved_tokens": total_tokens,
+                        "progress/elapsed_sec": time.time() - start_time,
+                    },
+                    step=traces_processed,
+                )
 
             if config.max_saved_tokens is not None and total_tokens >= config.max_saved_tokens:
                 stop_due_to_token_cap = True
@@ -813,6 +863,10 @@ def main():
         for name, arr in all_cognitive_labels.items():
             n_pos = sum(arr)
             logger.info(f"  Label '{name}': {n_pos}/{len(arr)} ({n_pos / max(len(arr), 1) * 100:.1f}%)")
+            if wandb_run is not None:
+                wandb.summary[f"labels/{name}_positive"] = n_pos
+                wandb.summary[f"labels/{name}_total"] = len(arr)
+                wandb.summary[f"labels/{name}_rate"] = n_pos / max(len(arr), 1)
 
     # Phase labels
     if config.enable_phase_tracking and all_phase_labels:
@@ -827,6 +881,17 @@ def main():
         n_incorrect = sum(1 for c in all_correctness if c == 0)
         n_unknown = sum(1 for c in all_correctness if c == -1)
         logger.info(f"  Correctness: {n_correct} correct, {n_incorrect} incorrect, {n_unknown} unknown tokens")
+        if wandb_run is not None:
+            n_known = max(n_correct + n_incorrect, 1)
+            wandb.log(
+                {
+                    "correctness/correct_tokens": n_correct,
+                    "correctness/incorrect_tokens": n_incorrect,
+                    "correctness/unknown_tokens": n_unknown,
+                    "correctness/accuracy_known_tokens": n_correct / n_known,
+                },
+                step=traces_processed,
+            )
 
     # Metadata
     metadata = {
@@ -861,6 +926,25 @@ def main():
         f"{traces_processed} traces ({len(examples)} examples) "
         f"saved to {output_dir} in {elapsed:.1f}s"
     )
+    if wandb_run is not None:
+        wandb.log(
+            {
+                "final/elapsed_sec": elapsed,
+                "final/total_saved_tokens": total_tokens,
+                "final/traces_processed": traces_processed,
+                "final/examples_loaded": len(examples),
+            },
+            step=traces_processed,
+        )
+        if config.wandb_upload_output_artifact:
+            artifact_name = (
+                config.wandb_artifact_name
+                or f"reasoning-acts-{Path(output_dir).name}"
+            )
+            artifact = wandb.Artifact(name=artifact_name, type="reasoning_activations")
+            artifact.add_dir(str(output_dir))
+            wandb.log_artifact(artifact)
+        wandb.finish()
 
 
 if __name__ == "__main__":
