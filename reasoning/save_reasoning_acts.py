@@ -14,6 +14,7 @@ import json
 import importlib.util
 import logging
 import os
+import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -125,6 +126,24 @@ class SaveReasoningActsConfig:
     keep_token_mappings_in_memory: bool = True
     keep_examples_metadata_in_memory: bool = True
     save_trace_metadata_jsonl: bool = True
+    # periodic Google Drive sync (e.g. /content/drive/MyDrive/...)
+    use_drive_sync: bool = False
+    drive_output_dir: Optional[str] = None
+    drive_sync_every_n_traces: int = 25
+    drive_sync_async: bool = True
+    drive_sync_globs: tuple[str, ...] = (
+        "data_*.npy",
+        "data_indices.npy",
+        "trace_metadata.jsonl",
+        "progress.json",
+        "metadata.json",
+        "rep_statistics.pt",
+        "config.yaml",
+        "dtype.txt",
+        "cognitive_labels.json",
+        "phase_labels.json",
+        "correctness_labels.json",
+    )
     # wandb logging
     use_wandb: bool = False
     wandb_project: str = "reasoning-activation-caching"
@@ -430,6 +449,8 @@ def apply_colab_defaults(config: SaveReasoningActsConfig) -> None:
     config.keep_token_mappings_in_memory = False
     config.keep_examples_metadata_in_memory = False
     config.save_trace_metadata_jsonl = True
+    if config.use_drive_sync and config.drive_output_dir is None:
+        config.drive_output_dir = "/content/drive/MyDrive/reasoning_acts_sync"
 
     logger.info(
         "Colab mode enabled: using managed saving defaults "
@@ -486,6 +507,41 @@ def schedule_wandb_live_sync(
     if pending_future is not None and not pending_future.done():
         return pending_future
     return executor.submit(refresh_wandb_live_sync, config, output_dir)
+
+
+def refresh_drive_sync(config: SaveReasoningActsConfig, output_dir: Path) -> None:
+    """
+    Copy selected output files to a Drive-mounted directory.
+    """
+    if not config.use_drive_sync or not config.drive_output_dir:
+        return
+    drive_dir = Path(config.drive_output_dir).expanduser()
+    drive_dir.mkdir(parents=True, exist_ok=True)
+
+    for pattern in config.drive_sync_globs:
+        for src in output_dir.glob(pattern):
+            if src.is_file():
+                dst = drive_dir / src.name
+                shutil.copy2(src, dst)
+
+
+def schedule_drive_sync(
+    config: SaveReasoningActsConfig,
+    output_dir: Path,
+    executor: Optional[ThreadPoolExecutor],
+    pending_future: Optional[Future],
+) -> Optional[Future]:
+    """
+    Trigger Drive sync without blocking extraction loop.
+    """
+    if not config.use_drive_sync or not config.drive_output_dir:
+        return pending_future
+    if executor is None or not config.drive_sync_async:
+        refresh_drive_sync(config, output_dir)
+        return pending_future
+    if pending_future is not None and not pending_future.done():
+        return pending_future
+    return executor.submit(refresh_drive_sync, config, output_dir)
 
 
 class StopOnTokenSequence(StoppingCriteria):
@@ -635,6 +691,13 @@ def main():
         wandb_sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wandb-sync")
     wandb_sync_future = schedule_wandb_live_sync(
         config, output_dir, wandb_sync_executor, wandb_sync_future
+    )
+    drive_sync_executor: Optional[ThreadPoolExecutor] = None
+    drive_sync_future: Optional[Future] = None
+    if config.use_drive_sync and config.drive_sync_async:
+        drive_sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drive-sync")
+    drive_sync_future = schedule_drive_sync(
+        config, output_dir, drive_sync_executor, drive_sync_future
     )
 
     # ── Load model ──────────────────────────────────────────────
@@ -861,6 +924,14 @@ def main():
                     config, output_dir, wandb_sync_executor, wandb_sync_future
                 )
             if (
+                config.use_drive_sync
+                and config.drive_sync_every_n_traces > 0
+                and traces_processed % config.drive_sync_every_n_traces == 0
+            ):
+                drive_sync_future = schedule_drive_sync(
+                    config, output_dir, drive_sync_executor, drive_sync_future
+                )
+            if (
                 wandb_run is not None
                 and config.wandb_log_every_n_traces > 0
                 and traces_processed % config.wandb_log_every_n_traces == 0
@@ -898,6 +969,9 @@ def main():
     (output_dir / "dtype.txt").write_text("float32")
     wandb_sync_future = schedule_wandb_live_sync(
         config, output_dir, wandb_sync_executor, wandb_sync_future
+    )
+    drive_sync_future = schedule_drive_sync(
+        config, output_dir, drive_sync_executor, drive_sync_future
     )
 
     # Normalization statistics
@@ -1010,6 +1084,13 @@ def main():
         wandb.finish()
     if wandb_sync_executor is not None:
         wandb_sync_executor.shutdown(wait=False)
+    if drive_sync_future is not None:
+        try:
+            drive_sync_future.result(timeout=120)
+        except Exception as e:
+            logger.warning(f"Non-fatal: drive sync finalization failed: {e}")
+    if drive_sync_executor is not None:
+        drive_sync_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
