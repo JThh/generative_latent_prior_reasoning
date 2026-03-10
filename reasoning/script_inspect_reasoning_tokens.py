@@ -1,10 +1,14 @@
 """
 Simple utility to inspect reasoning-model generation token by token.
 
+Optimized for Qwen chat models (default: Qwen/Qwen3-1.7B).
+
 Shows:
+  - Prompt token IDs and per-token decoded strings
   - Raw generated token IDs (no decoding)
-  - Per-token string forms
+  - Per-token string forms during generation
   - Full decoded output with and without special-token skipping
+  - Explicit `<think>` / `</think>` token-id diagnostics
 
 Optional:
   - Stop generation as soon as `</think>` appears (default), useful for fast activation collection.
@@ -50,15 +54,17 @@ def sample_next_token(logits: torch.Tensor, do_sample: bool, temperature: float)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--do_sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--use_chat_template", action="store_true")
+    parser.add_argument("--use_chat_template", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--enable_thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--system_prompt", type=str, default="You are a helpful reasoning assistant.")
+    parser.add_argument("--show_prompt_tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stop_at_think_start", action="store_true")
     parser.add_argument("--stop_at_think_end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stop_on_eos", action="store_true")
@@ -84,17 +90,35 @@ def main():
             {"role": "system", "content": args.system_prompt},
             {"role": "user", "content": args.prompt},
         ]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            enable_thinking=args.enable_thinking,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(device)
+        prompt_text = tokenizer.decode(model_inputs["input_ids"][0], skip_special_tokens=False)
     else:
         prompt_text = args.prompt
-
-    model_inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+        model_inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     input_ids = model_inputs["input_ids"]
     attention_mask = model_inputs.get("attention_mask", None)
 
     think_start_ids = tokenizer.encode("<think>", add_special_tokens=False)
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     generated_ids: list[int] = []
+
+    print(f"[info] <think> ids={think_start_ids}")
+    print(f"[info] </think> ids={think_end_ids}")
+    if args.show_prompt_tokens:
+        prompt_ids = input_ids[0].tolist()
+        print("\n=== PROMPT TOKENS ===")
+        print(f"prompt_token_count={len(prompt_ids)}")
+        for i, tid in enumerate(prompt_ids):
+            piece = tokenizer.convert_ids_to_tokens([tid])[0]
+            decoded = tokenizer.decode([tid], skip_special_tokens=False)
+            print(f"prompt[{i:03d}] id={tid:<8} piece={repr(piece)} decoded={repr(decoded)}")
 
     past_key_values = None
     next_input_ids = input_ids

@@ -85,7 +85,7 @@ PHASE_TO_IDX = {
 @dataclass
 class SaveReasoningActsConfig:
     # model
-    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    model_name: str = "Qwen/Qwen3-1.7B"
     model_source: Optional[str] = None
     torch_dtype: str = "bfloat16"
     device: str = "cuda:0"
@@ -113,6 +113,7 @@ class SaveReasoningActsConfig:
     temperature: float = 0.7             # range: 0.6-1.0
     do_sample: bool = False              # auto-set True if num_traces > 1
     use_chat_template: bool = True
+    chat_template_enable_thinking: bool = True
     # task type tagging for conditioning
     task_type: Optional[str] = None      # "math", "code", "logic" — auto-detected from source
     # output
@@ -528,7 +529,11 @@ def extract_cot_activations(
     """
     # Prepare input
     if config.use_chat_template and hasattr(tokenizer, "apply_chat_template"):
-        prompt = format_chat_prompt(question, tokenizer)
+        prompt = format_chat_prompt(
+            question,
+            tokenizer,
+            enable_thinking=config.chat_template_enable_thinking,
+        )
     else:
         prompt = format_reasoning_prompt(question)
 

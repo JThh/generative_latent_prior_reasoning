@@ -655,6 +655,7 @@ def format_chat_prompt(
     question: str,
     tokenizer,
     system_prompt: Optional[str] = None,
+    enable_thinking: Optional[bool] = True,
 ) -> str:
     """Format using the model's chat template (preferred for reasoning models)."""
     if system_prompt is None:
@@ -666,11 +667,18 @@ def format_chat_prompt(
     ]
 
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        try:
+            return tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            # Backward compatibility for tokenizers/templates without enable_thinking.
+            kwargs.pop("enable_thinking", None)
+            return tokenizer.apply_chat_template(messages, **kwargs)
     else:
         return format_reasoning_prompt(question, system_prompt)
 
