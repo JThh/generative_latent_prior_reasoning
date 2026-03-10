@@ -15,6 +15,7 @@ import importlib.util
 import logging
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -133,6 +134,16 @@ class SaveReasoningActsConfig:
     wandb_log_every_n_traces: int = 10
     wandb_upload_output_artifact: bool = True
     wandb_artifact_name: Optional[str] = None
+    wandb_live_sync_output: bool = True
+    wandb_live_sync_async: bool = True
+    wandb_live_sync_globs: tuple[str, ...] = (
+        "data_*.npy",
+        "data_indices.npy",
+        "trace_metadata.jsonl",
+        "progress.json",
+        "metadata.json",
+        "rep_statistics.pt",
+    )
     # labeling
     enable_labeling: bool = True
     enable_phase_tracking: bool = True
@@ -447,6 +458,35 @@ def init_wandb_run(config: SaveReasoningActsConfig, output_dir: Path):
     return run
 
 
+def refresh_wandb_live_sync(config: SaveReasoningActsConfig, output_dir: Path) -> None:
+    """
+    Ensure output files are continuously synced to W&B during the run.
+    """
+    if not config.use_wandb or wandb is None or not config.wandb_live_sync_output:
+        return
+    for pattern in config.wandb_live_sync_globs:
+        wandb.save(str(output_dir / pattern), policy="live")
+
+
+def schedule_wandb_live_sync(
+    config: SaveReasoningActsConfig,
+    output_dir: Path,
+    executor: Optional[ThreadPoolExecutor],
+    pending_future: Optional[Future],
+) -> Optional[Future]:
+    """
+    Trigger W&B live sync without blocking the extraction loop.
+    """
+    if not config.use_wandb or wandb is None or not config.wandb_live_sync_output:
+        return pending_future
+    if executor is None or not config.wandb_live_sync_async:
+        refresh_wandb_live_sync(config, output_dir)
+        return pending_future
+    if pending_future is not None and not pending_future.done():
+        return pending_future
+    return executor.submit(refresh_wandb_live_sync, config, output_dir)
+
+
 class StopOnTokenSequence(StoppingCriteria):
     """
     Stop generation once a target token-id sequence appears as a suffix
@@ -584,6 +624,13 @@ def main():
     logger.info(f"Config: {config}")
     logger.info(f"Output directory: {output_dir}")
     wandb_run = init_wandb_run(config, output_dir)
+    wandb_sync_executor: Optional[ThreadPoolExecutor] = None
+    wandb_sync_future: Optional[Future] = None
+    if wandb_run is not None and config.wandb_live_sync_async:
+        wandb_sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wandb-sync")
+    wandb_sync_future = schedule_wandb_live_sync(
+        config, output_dir, wandb_sync_executor, wandb_sync_future
+    )
 
     # ── Load model ──────────────────────────────────────────────
     config.device = resolve_device(str(config.device))
@@ -805,6 +852,9 @@ def main():
                         f,
                         indent=2,
                     )
+                wandb_sync_future = schedule_wandb_live_sync(
+                    config, output_dir, wandb_sync_executor, wandb_sync_future
+                )
             if (
                 wandb_run is not None
                 and config.wandb_log_every_n_traces > 0
@@ -841,6 +891,9 @@ def main():
     # ── Flush and save ──────────────────────────────────────────
     writer.flush()
     (output_dir / "dtype.txt").write_text("float32")
+    wandb_sync_future = schedule_wandb_live_sync(
+        config, output_dir, wandb_sync_executor, wandb_sync_future
+    )
 
     # Normalization statistics
     if total_tokens > 0:
@@ -927,6 +980,11 @@ def main():
         f"saved to {output_dir} in {elapsed:.1f}s"
     )
     if wandb_run is not None:
+        if wandb_sync_future is not None:
+            try:
+                wandb_sync_future.result(timeout=30)
+            except Exception as e:
+                logger.warning(f"Non-fatal: wandb live sync finalization failed: {e}")
         wandb.log(
             {
                 "final/elapsed_sec": elapsed,
@@ -945,6 +1003,8 @@ def main():
             artifact.add_dir(str(output_dir))
             wandb.log_artifact(artifact)
         wandb.finish()
+    if wandb_sync_executor is not None:
+        wandb_sync_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
