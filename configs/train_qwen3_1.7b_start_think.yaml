@@ -1,0 +1,51 @@
+# Example:
+# 1. Export a GLP-ready dataset of only the start-<think> activations:
+#    uv run python reasoning/load_reasoning_acts.py \
+#        acts_dir=/home/juliushan/reasoning_acts \
+#        export_glp_dataset=true \
+#        export_selector=start_think \
+#        output_dir=/home/juliushan/data/qwen3-1.7b-layer14-start-think
+#
+# 2. Train a GLP on that exported dataset:
+#    python3 glp_train.py config=configs/train_qwen3_1.7b_start_think.yaml
+save_root: .
+model_name: Qwen/Qwen3-1.7B
+run_name: glp-qwen3-1.7b-start-think-d${glp_kwargs.denoiser_config.n_layers}
+output_path: ${save_root}/runs/${run_name}
+
+wandb_enabled: True
+wandb_project: reasoning-glp
+wandb_run_name: ${run_name}
+
+train_dataset: /home/juliushan/data/qwen3-1.7b-layer14-start-think
+rep_statistic: ${train_dataset}/rep_statistics.pt
+num_epochs: 100
+save_epochs: [1, 10, 25, 50, 100]
+shuffle: True
+
+glp_kwargs:
+  normalizer_config:
+    rep_statistic: ${rep_statistic}
+  denoiser_config:
+    d_input: 2048
+    d_model: 4096
+    d_mlp: 8192
+    n_layers: 6
+    multi_layer_n_layers: null
+  tracedict_config:
+    layer_prefix: "model.layers"
+    layers: [14]
+    retain: "output"
+
+use_bf16: True
+learning_rate: 1e-4
+batch_size: 256
+gradient_accumulation_steps: 1
+gradient_clipping_threshold: 1
+log_every_n_steps: 10
+save_opt_state: True
+lr_scheduler:
+  scheduler_cls: cosine_scheduler_with_warmup
+  warmup_ratio: 0.05
+  initial_factor: 0.01
+  final_factor: 0.1
